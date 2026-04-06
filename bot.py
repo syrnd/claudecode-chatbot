@@ -5,6 +5,7 @@ import logging
 import os
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -24,6 +25,9 @@ ALLOWED_USER_IDS = set(
 CLAUDE_CMD = os.getenv("CLAUDE_CMD", "/home/sikim/.npm-global/bin/claude")
 CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "600"))
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
+TASK_QUIET_AFTER = int(os.getenv("TASK_QUIET_AFTER", "180"))
+TASK_STALLED_AFTER = int(os.getenv("TASK_STALLED_AFTER", "480"))
+STALL_CHECK_INTERVAL = int(os.getenv("STALL_CHECK_INTERVAL", "60"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -33,7 +37,9 @@ logger = logging.getLogger(__name__)
 
 # Session 持久化文件
 SESSIONS_FILE = "/srv/claudecode-chatbot/sessions.json"
+TASKS_DIR = Path("/srv/claudecode-chatbot/tasks")
 sessions_lock = Lock()
+task_state_lock = Lock()
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 
@@ -45,6 +51,8 @@ class RunningTask:
     prompt_preview: str
     status_message_chat_id: int
     status_message_id: int
+    task_id: str
+    stalled_notified: bool = False
 
 
 active_tasks: dict[int, RunningTask] = {}
@@ -78,6 +86,197 @@ def save_sessions(sessions: dict[int, str]):
     except Exception:
         logger.exception("save_sessions error")
 
+
+def ensure_tasks_dir():
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def current_task_file(user_id: int) -> Path:
+    return TASKS_DIR / f"user-{user_id}-current.json"
+
+
+def task_log_file(task_id: str) -> Path:
+    return TASKS_DIR / f"{task_id}.log"
+
+
+def human_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, sec = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}小时{minutes}分钟"
+    if minutes:
+        return f"{minutes}分钟{sec}秒"
+    return f"{sec}秒"
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def load_task_state(user_id: int) -> dict | None:
+    try:
+        path = current_task_file(user_id)
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        logger.exception("load_task_state error user=%d", user_id)
+    return None
+
+
+def save_task_state(state: dict):
+    try:
+        ensure_tasks_dir()
+        path = current_task_file(int(state["user_id"]))
+        with task_state_lock:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=path.parent,
+                delete=False,
+                encoding="utf-8",
+            ) as tmp:
+                json.dump(state, tmp, ensure_ascii=False, indent=2)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                temp_name = tmp.name
+            os.replace(temp_name, path)
+    except Exception:
+        logger.exception("save_task_state error task_id=%s", state.get("task_id"))
+
+
+def append_task_log(task_id: str, message: str):
+    try:
+        ensure_tasks_dir()
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts()))
+        with open(task_log_file(task_id), "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        logger.exception("append_task_log error task_id=%s", task_id)
+
+
+def update_task_state(
+    user_id: int,
+    *,
+    status: str | None = None,
+    last_progress: str | None = None,
+    error: str | None = None,
+    pid: int | None = None,
+    session_id: str | None = None,
+    finished: bool = False,
+    stalled_notified: bool | None = None,
+    touch_activity: bool = True,
+) -> dict | None:
+    state = load_task_state(user_id)
+    if not state:
+        return None
+
+    state["updated_at"] = now_ts()
+    if status is not None:
+        state["status"] = status
+    if last_progress is not None:
+        state["last_progress"] = last_progress
+        if touch_activity:
+            state["last_activity_at"] = state["updated_at"]
+    if error is not None:
+        state["error"] = error
+    if pid is not None:
+        state["pid"] = pid
+    if session_id is not None:
+        state["session_id"] = session_id
+    if finished:
+        state["finished_at"] = state["updated_at"]
+    if stalled_notified is not None:
+        state["stalled_notified"] = stalled_notified
+
+    save_task_state(state)
+    if last_progress:
+        append_task_log(str(state["task_id"]), last_progress)
+    return state
+
+
+def create_task_state(user_id: int, prompt: str, prompt_preview: str, task_id: str):
+    state = {
+        "task_id": task_id,
+        "user_id": user_id,
+        "prompt": prompt,
+        "prompt_preview": prompt_preview,
+        "status": "queued",
+        "created_at": now_ts(),
+        "started_at": None,
+        "updated_at": now_ts(),
+        "finished_at": None,
+        "last_progress": "任务已接收，等待执行",
+        "last_activity_at": now_ts(),
+        "error": None,
+        "pid": None,
+        "session_id": user_sessions.get(user_id),
+        "stalled_notified": False,
+    }
+    save_task_state(state)
+    append_task_log(task_id, "任务已接收，等待执行")
+    return state
+
+
+def compute_health(state: dict | None) -> str:
+    if not state:
+        return "unknown"
+    if state.get("status") != "running":
+        return state.get("status", "unknown")
+
+    last_activity = float(state.get("last_activity_at") or state.get("updated_at") or now_ts())
+    idle_for = now_ts() - last_activity
+    if idle_for >= TASK_STALLED_AFTER:
+        return "stalled"
+    if idle_for >= TASK_QUIET_AFTER:
+        return "quiet"
+    return "active"
+
+
+def format_status_text(state: dict | None) -> str:
+    if not state:
+        return "当前没有任务记录。"
+
+    status = state.get("status", "unknown")
+    health = compute_health(state)
+    start_ts = state.get("started_at") or state.get("created_at") or now_ts()
+    updated_ts = state.get("updated_at") or now_ts()
+    lines = [
+        f"任务状态：{status}",
+        f"已运行：{human_duration(now_ts() - float(start_ts))}",
+        f"最近进展：{state.get('last_progress') or '暂无'}",
+        f"最近更新：{human_duration(now_ts() - float(updated_ts))}前",
+    ]
+    if status == "running":
+        health_text = {
+            "active": "active",
+            "quiet": "quiet",
+            "stalled": "stalled（疑似卡住）",
+        }.get(health, health)
+        lines.append(f"健康状态：{health_text}")
+    if state.get("error"):
+        lines.append(f"错误信息：{state['error'][:500]}")
+    return "\n".join(lines)
+
+
+def read_recent_logs(user_id: int, limit: int = 8) -> list[str]:
+    state = load_task_state(user_id)
+    if not state:
+        return []
+
+    log_path = task_log_file(str(state["task_id"]))
+    if not log_path.exists():
+        return []
+
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            lines = [line.rstrip() for line in f.readlines() if line.strip()]
+        return lines[-limit:]
+    except Exception:
+        logger.exception("read_recent_logs error user=%d", user_id)
+        return []
+
+
 # 每个用户的 claude session_id，用于多轮对话
 user_sessions: dict[int, str] = load_sessions()
 
@@ -105,6 +304,12 @@ async def ask_claude(user_id: int, message: str) -> tuple[str, str | None]:
         running_task = active_tasks.get(user_id)
         if running_task:
             running_task.process = process
+            update_task_state(
+                user_id,
+                status="running",
+                pid=process.pid,
+                last_progress="Claude 任务已启动",
+            )
 
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             process.communicate(),
@@ -115,6 +320,13 @@ async def ask_claude(user_id: int, message: str) -> tuple[str, str | None]:
 
         if process.returncode != 0:
             logger.error("claude stderr: %s", stderr)
+            update_task_state(
+                user_id,
+                status="error",
+                last_progress="任务执行失败",
+                error=stderr[:1000] or f"Claude 返回非零退出码: {process.returncode}",
+                finished=True,
+            )
             return f"Claude 执行出错：{stderr[:500]}", None
 
         data = json.loads(stdout)
@@ -122,6 +334,7 @@ async def ask_claude(user_id: int, message: str) -> tuple[str, str | None]:
         if session_id:
             user_sessions[user_id] = session_id
             await asyncio.to_thread(save_sessions, user_sessions)
+            update_task_state(user_id, session_id=session_id)
 
         logger.info("claude task finished user=%d returncode=%s", user_id, process.returncode)
         return data.get("result", "（无回复）"), session_id
@@ -132,6 +345,13 @@ async def ask_claude(user_id: int, message: str) -> tuple[str, str | None]:
             with contextlib.suppress(Exception):
                 await process.wait()
         logger.warning("claude task timeout user=%d timeout=%ds", user_id, CLAUDE_TIMEOUT)
+        update_task_state(
+            user_id,
+            status="timeout",
+            last_progress="任务超时",
+            error=f"Claude 在 {CLAUDE_TIMEOUT} 秒内未完成",
+            finished=True,
+        )
         return (
             f"请求超时：Claude 在 {CLAUDE_TIMEOUT} 秒内未完成。"
             " 可以用 /status 查看任务状态，或用 /cancel 取消后重试。",
@@ -142,6 +362,13 @@ async def ask_claude(user_id: int, message: str) -> tuple[str, str | None]:
         return stdout.strip() or "解析响应失败。", None
     except Exception as e:
         logger.exception("ask_claude error")
+        update_task_state(
+            user_id,
+            status="error",
+            last_progress="任务执行失败",
+            error=str(e),
+            finished=True,
+        )
         return f"发生错误：{e}", None
 
 
@@ -161,6 +388,41 @@ async def update_status_message(
         logger.debug("status message update skipped", exc_info=True)
 
 
+async def stalled_monitor(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    while True:
+        await asyncio.sleep(STALL_CHECK_INTERVAL)
+        running = active_tasks.get(user_id)
+        if not running or running.task.done():
+            return
+
+        state = load_task_state(user_id)
+        if not state or state.get("status") != "running":
+            continue
+
+        if compute_health(state) != "stalled" or running.stalled_notified:
+            continue
+
+        running.stalled_notified = True
+        update_task_state(
+            user_id,
+            last_progress="最近没有新的执行反馈，任务疑似卡住",
+            stalled_notified=True,
+            touch_activity=False,
+        )
+        await update_status_message(
+            context,
+            running.status_message_chat_id,
+            running.status_message_id,
+            "任务执行中，但最近长时间没有新的执行反馈。\n"
+            "状态：疑似卡住\n"
+            f"摘要: {running.prompt_preview}",
+        )
+        await context.bot.send_message(
+            chat_id=running.status_message_chat_id,
+            text="任务疑似卡住。可用 /status 查看详情，或用 /cancel 取消。",
+        )
+
+
 async def run_claude_task(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -168,9 +430,11 @@ async def run_claude_task(
     user_text: str,
 ):
     running = active_tasks[user_id]
+    monitor_task = asyncio.create_task(stalled_monitor(context, user_id))
 
     try:
         if task_semaphore.locked():
+            update_task_state(user_id, status="queued", last_progress="任务排队中")
             await update_status_message(
                 context,
                 running.status_message_chat_id,
@@ -180,6 +444,14 @@ async def run_claude_task(
             )
 
         async with task_semaphore:
+            state = update_task_state(
+                user_id,
+                status="running",
+                last_progress="任务开始执行",
+            )
+            if state and not state.get("started_at"):
+                state["started_at"] = now_ts()
+                save_task_state(state)
             await update_status_message(
                 context,
                 running.status_message_chat_id,
@@ -190,6 +462,25 @@ async def run_claude_task(
             reply, _session_id = await ask_claude(user_id, user_text)
 
         elapsed = int(time.time() - running.started_at)
+        final_state = load_task_state(user_id)
+        if final_state and final_state.get("status") in {"timeout", "error"}:
+            status_text = format_status_text(final_state)
+            await update_status_message(
+                context,
+                running.status_message_chat_id,
+                running.status_message_id,
+                status_text,
+            )
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+            logger.info("task ended user=%d status=%s", user_id, final_state.get("status"))
+            return
+
+        update_task_state(
+            user_id,
+            status="done",
+            last_progress="任务完成",
+            finished=True,
+        )
         summary = (
             "任务完成。\n"
             f"耗时: {elapsed} 秒\n"
@@ -204,6 +495,12 @@ async def run_claude_task(
         await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
         logger.info("task delivered user=%d elapsed=%ds", user_id, elapsed)
     except asyncio.CancelledError:
+        update_task_state(
+            user_id,
+            status="cancelled",
+            last_progress="任务已取消",
+            finished=True,
+        )
         await update_status_message(
             context,
             running.status_message_chat_id,
@@ -213,6 +510,13 @@ async def run_claude_task(
         )
         raise
     except Exception:
+        update_task_state(
+            user_id,
+            status="error",
+            last_progress="任务执行失败",
+            error="后台任务异常退出",
+            finished=True,
+        )
         await update_status_message(
             context,
             running.status_message_chat_id,
@@ -222,20 +526,14 @@ async def run_claude_task(
         )
         raise
     finally:
+        monitor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitor_task
         active_tasks.pop(user_id, None)
 
 
 def format_task_status(user_id: int) -> str:
-    running = active_tasks.get(user_id)
-    if not running:
-        return "当前没有运行中的任务。"
-
-    elapsed = int(time.time() - running.started_at)
-    return (
-        "当前有一个任务正在运行。\n"
-        f"已运行: {elapsed} 秒\n"
-        f"摘要: {running.prompt_preview}"
-    )
+    return format_status_text(load_task_state(user_id))
 
 
 def is_allowed(user_id: int) -> bool:
@@ -281,6 +579,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     thinking_msg = await update.message.reply_text("任务已接收，准备启动...")
     prompt_preview = user_text.strip().replace("\n", " ")[:120] or "（空消息）"
+    task_id = uuid.uuid4().hex[:12]
+    create_task_state(user_id, user_text, prompt_preview, task_id)
     task = asyncio.create_task(run_claude_task(update, context, user_id, user_text))
     active_tasks[user_id] = RunningTask(
         task=task,
@@ -289,6 +589,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt_preview=prompt_preview,
         status_message_chat_id=thinking_msg.chat_id,
         status_message_id=thinking_msg.message_id,
+        task_id=task_id,
     )
 
     def on_task_done(done_task: asyncio.Task):
@@ -308,6 +609,19 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(user_id):
         return
     await update.message.reply_text(format_task_status(user_id))
+
+
+async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        return
+
+    lines = read_recent_logs(user_id)
+    if not lines:
+        await update.message.reply_text("当前没有可查看的任务日志。")
+        return
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,6 +653,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("logs", logs))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
