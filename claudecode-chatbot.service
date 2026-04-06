@@ -9,7 +9,7 @@ WorkingDirectory=/srv/claudecode-chatbot
 ExecStart=/srv/claudecode-chatbot/.venv/bin/python3 /srv/claudecode-chatbot/bot.py
 Restart=always
 RestartSec=5
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=/home/sikim/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
 WantedBy=multi-user.target
