@@ -319,6 +319,23 @@ async def ask_claude(user_id: int, message: str) -> tuple[str, str | None]:
         stderr = stderr_bytes.decode("utf-8", errors="replace")
 
         if process.returncode != 0:
+            # Try to parse stdout for structured error (e.g. invalid session)
+            session_error = False
+            try:
+                err_data = json.loads(stdout)
+                err_msg = err_data.get("result", "")
+                if "Invalid" in err_msg and user_sessions.get(user_id):
+                    logger.warning("session error detected, clearing session and retrying: %s", err_msg[:200])
+                    user_sessions.pop(user_id, None)
+                    await asyncio.to_thread(save_sessions, user_sessions)
+                    session_error = True
+            except Exception:
+                pass
+
+            if session_error:
+                # Retry without session
+                return await ask_claude(user_id, message)
+
             logger.error("claude stderr: %s", stderr)
             update_task_state(
                 user_id,
