@@ -349,6 +349,13 @@ async def ask_claude(user_id: int, message: str, _retry: int = 0) -> tuple[str, 
             if session_error:
                 if _retry >= 1:
                     logger.error("session retry exceeded, giving up")
+                    update_task_state(
+                        user_id,
+                        status="error",
+                        last_progress="会话恢复失败",
+                        error="会话恢复失败，请用 /reset 重置后重试。",
+                        finished=True,
+                    )
                     return "会话恢复失败，请用 /reset 重置后重试。", None
                 return await ask_claude(user_id, message, _retry + 1)
 
@@ -698,6 +705,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("请在 .env 中设置 TELEGRAM_BOT_TOKEN")
+    if not ALLOWED_USER_IDS:
+        raise SystemExit("ALLOWED_USER_IDS 未配置，拒绝启动（安全风险：任何人均可操控此 bot）")
 
     cleanup_old_logs()
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
