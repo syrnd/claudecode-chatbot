@@ -11,8 +11,8 @@ from pathlib import Path
 from threading import Lock
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 load_dotenv()
 
@@ -38,9 +38,23 @@ logger = logging.getLogger(__name__)
 
 # Session 持久化文件
 SESSIONS_FILE = "/srv/claudecode-chatbot/sessions.json"
+USER_SETTINGS_FILE = "/srv/claudecode-chatbot/user_settings.json"
 TASKS_DIR = Path("/srv/claudecode-chatbot/tasks")
 sessions_lock = Lock()
 task_state_lock = Lock()
+user_settings_lock = Lock()
+
+AVAILABLE_MODELS = [
+    ("claude-sonnet-4-6", "Sonnet 4.6"),
+    ("claude-opus-4-6", "Opus 4.6"),
+    ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+]
+MODEL_ALIASES = {
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+DEFAULT_MODEL = "claude-sonnet-4-6"
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 
@@ -67,6 +81,48 @@ def load_sessions() -> dict[int, str]:
     except Exception:
         logger.exception("load_sessions error")
     return {}
+
+def load_user_settings() -> dict[int, dict]:
+    try:
+        if os.path.exists(USER_SETTINGS_FILE):
+            with open(USER_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return {int(k): v for k, v in json.load(f).items()}
+    except Exception:
+        logger.exception("load_user_settings error")
+    return {}
+
+
+def save_user_settings(settings: dict[int, dict]):
+    try:
+        path = Path(USER_SETTINGS_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with user_settings_lock:
+            with tempfile.NamedTemporaryFile(
+                "w", dir=path.parent, delete=False, encoding="utf-8"
+            ) as tmp:
+                json.dump({str(k): v for k, v in settings.items()}, tmp, ensure_ascii=False)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                temp_name = tmp.name
+            os.replace(temp_name, path)
+    except Exception:
+        logger.exception("save_user_settings error")
+
+
+def get_user_model(user_id: int) -> str:
+    return user_settings.get(user_id, {}).get("model", DEFAULT_MODEL)
+
+
+def get_user_workdir(user_id: int) -> str | None:
+    return user_settings.get(user_id, {}).get("workdir")
+
+
+def set_user_setting(user_id: int, key: str, value):
+    if user_id not in user_settings:
+        user_settings[user_id] = {}
+    user_settings[user_id][key] = value
+    save_user_settings(user_settings)
+
 
 def save_sessions(sessions: dict[int, str]):
     try:
@@ -293,11 +349,13 @@ def read_recent_logs(user_id: int, limit: int = 8) -> list[str]:
 
 # 每个用户的 claude session_id，用于多轮对话
 user_sessions: dict[int, str] = load_sessions()
+user_settings: dict[int, dict] = load_user_settings()
 
 
 def build_claude_cmd(user_id: int, message: str) -> list[str]:
     session_id = user_sessions.get(user_id)
-    cmd = [CLAUDE_CMD, "--dangerously-skip-permissions", "-p", "--output-format", "json"]
+    model = get_user_model(user_id)
+    cmd = [CLAUDE_CMD, "--dangerously-skip-permissions", "-p", "--output-format", "json", "--model", model]
     if session_id:
         cmd += ["--resume", session_id]
     cmd.append(message)
@@ -310,10 +368,12 @@ async def ask_claude(user_id: int, message: str, _retry: int = 0) -> tuple[str, 
 
     try:
         logger.info("starting claude task user=%d timeout=%ds", user_id, CLAUDE_TIMEOUT)
+        workdir = get_user_workdir(user_id)
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=workdir,
         )
         running_task = active_tasks.get(user_id)
         if running_task:
@@ -702,6 +762,96 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("已取消当前任务。")
 
 
+async def model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        return
+
+    current = get_user_model(user_id)
+    current_name = next((name for mid, name in AVAILABLE_MODELS if mid == current), current)
+
+    if not context.args:
+        await update.message.reply_text(f"当前模型：{current_name}\n用 /models 查看可用模型列表。")
+        return
+
+    alias = context.args[0].lower()
+    model_id = MODEL_ALIASES.get(alias, alias)
+    model_name = next((name for mid, name in AVAILABLE_MODELS if mid == model_id), None)
+    if not model_name:
+        aliases = ", ".join(MODEL_ALIASES.keys())
+        await update.message.reply_text(f"未知模型：{alias}\n可用简写：{aliases}")
+        return
+
+    set_user_setting(user_id, "model", model_id)
+    await update.message.reply_text(f"已切换到 {model_name}。")
+
+
+async def models(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        return
+
+    current = get_user_model(user_id)
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'✅ ' if mid == current else ''}{name}",
+            callback_data=f"model:{mid}"
+        )]
+        for mid, name in AVAILABLE_MODELS
+    ]
+    await update.message.reply_text(
+        "选择模型：",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def models_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not is_allowed(user_id):
+        await query.answer("无权限。")
+        return
+
+    model_id = query.data.split(":", 1)[1]
+    model_name = next((name for mid, name in AVAILABLE_MODELS if mid == model_id), None)
+    if not model_name:
+        await query.answer("未知模型。")
+        return
+
+    set_user_setting(user_id, "model", model_id)
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'✅ ' if mid == model_id else ''}{name}",
+            callback_data=f"model:{mid}"
+        )]
+        for mid, name in AVAILABLE_MODELS
+    ]
+    await query.edit_message_text(
+        f"已切换到 {model_name}。",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    await query.answer()
+
+
+async def workdir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        return
+
+    if not context.args:
+        current = get_user_workdir(user_id) or "（默认，bot 所在目录）"
+        await update.message.reply_text(f"当前工作目录：{current}")
+        return
+
+    path = " ".join(context.args)
+    if not os.path.isdir(path):
+        await update.message.reply_text(f"路径不存在或不是目录：{path}")
+        return
+
+    set_user_setting(user_id, "workdir", path)
+    await update.message.reply_text(f"工作目录已切换到：{path}")
+
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("请在 .env 中设置 TELEGRAM_BOT_TOKEN")
@@ -715,6 +865,10 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("logs", logs))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("model", model))
+    app.add_handler(CommandHandler("models", models))
+    app.add_handler(CommandHandler("workdir", workdir))
+    app.add_handler(CallbackQueryHandler(models_callback, pattern=r"^model:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot 启动，开始 polling...")
