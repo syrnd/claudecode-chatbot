@@ -28,6 +28,7 @@ MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
 TASK_QUIET_AFTER = int(os.getenv("TASK_QUIET_AFTER", "180"))
 TASK_STALLED_AFTER = int(os.getenv("TASK_STALLED_AFTER", "480"))
 STALL_CHECK_INTERVAL = int(os.getenv("STALL_CHECK_INTERVAL", "60"))
+TASK_LOG_RETENTION_DAYS = int(os.getenv("TASK_LOG_RETENTION_DAYS", "7"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -89,6 +90,19 @@ def save_sessions(sessions: dict[int, str]):
 
 def ensure_tasks_dir():
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_old_logs():
+    if not TASKS_DIR.exists():
+        return
+    cutoff = now_ts() - TASK_LOG_RETENTION_DAYS * 86400
+    for log_file in TASKS_DIR.glob("*.log"):
+        try:
+            if log_file.stat().st_mtime < cutoff:
+                log_file.unlink()
+                logger.info("deleted old log %s", log_file.name)
+        except Exception:
+            logger.exception("cleanup_old_logs error file=%s", log_file.name)
 
 
 def current_task_file(user_id: int) -> Path:
@@ -283,14 +297,14 @@ user_sessions: dict[int, str] = load_sessions()
 
 def build_claude_cmd(user_id: int, message: str) -> list[str]:
     session_id = user_sessions.get(user_id)
-    cmd = [CLAUDE_CMD, "-p", "--output-format", "json"]
+    cmd = [CLAUDE_CMD, "--dangerously-skip-permissions", "-p", "--output-format", "json"]
     if session_id:
         cmd += ["--resume", session_id]
     cmd.append(message)
     return cmd
 
 
-async def ask_claude(user_id: int, message: str) -> tuple[str, str | None]:
+async def ask_claude(user_id: int, message: str, _retry: int = 0) -> tuple[str, str | None]:
     cmd = build_claude_cmd(user_id, message)
     process = None
 
@@ -333,8 +347,10 @@ async def ask_claude(user_id: int, message: str) -> tuple[str, str | None]:
                 pass
 
             if session_error:
-                # Retry without session
-                return await ask_claude(user_id, message)
+                if _retry >= 1:
+                    logger.error("session retry exceeded, giving up")
+                    return "会话恢复失败，请用 /reset 重置后重试。", None
+                return await ask_claude(user_id, message, _retry + 1)
 
             logger.error("claude stderr: %s", stderr)
             update_task_state(
@@ -387,6 +403,16 @@ async def ask_claude(user_id: int, message: str) -> tuple[str, str | None]:
             finished=True,
         )
         return f"发生错误：{e}", None
+
+
+async def send_message_chunked(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    max_length: int = 4000,
+):
+    for i in range(0, len(text), max_length):
+        await context.bot.send_message(chat_id=chat_id, text=text[i:i + max_length])
 
 
 async def update_status_message(
@@ -488,7 +514,7 @@ async def run_claude_task(
                 running.status_message_id,
                 status_text,
             )
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+            await send_message_chunked(context, update.effective_chat.id, reply)
             logger.info("task ended user=%d status=%s", user_id, final_state.get("status"))
             return
 
@@ -633,12 +659,19 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(user_id):
         return
 
-    lines = read_recent_logs(user_id)
+    limit = 8
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 50))
+        except ValueError:
+            pass
+
+    lines = read_recent_logs(user_id, limit=limit)
     if not lines:
         await update.message.reply_text("当前没有可查看的任务日志。")
         return
 
-    await update.message.reply_text("\n".join(lines))
+    await send_message_chunked(context, update.effective_chat.id, "\n".join(lines))
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -666,6 +699,7 @@ def main():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("请在 .env 中设置 TELEGRAM_BOT_TOKEN")
 
+    cleanup_old_logs()
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
