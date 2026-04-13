@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /home/sikim/.npm-global:/home/sikim/.npm-global:ro
+      - /home/sikim/.claude:/home/sikim/.claude
+      - /home/sikim/project:/home/sikim/project
+      - /srv/claudecode-chatbot/sessions.json:/app/sessions.json
+      - /srv/claudecode-chatbot/tasks:/app/tasks
