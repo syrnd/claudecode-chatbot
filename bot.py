@@ -935,6 +935,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/model [alias] — 查看或切换模型（sonnet/opus/haiku）\n"
         "/models — 显示可用模型列表\n"
         "/workdir [path] — 查看或切换工作目录\n"
+        "/ls — 浏览项目目录（点击切换）\n"
         "/history [n] — 查看最近 n 个任务历史（默认 5）\n\n"
         "直接发送文本消息即可创建新任务。"
     )
@@ -1171,6 +1172,71 @@ async def workdir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"工作目录已切换到：{resolved}")
 
 
+def _list_dirs(path: str) -> list[str]:
+    """列出目录下的子目录，按名称排序。"""
+    try:
+        return sorted(
+            d for d in os.listdir(path)
+            if os.path.isdir(os.path.join(path, d)) and not d.startswith(".")
+        )
+    except OSError:
+        return []
+
+
+def _build_ls_keyboard(current_dir: str) -> InlineKeyboardMarkup:
+    dirs = _list_dirs(current_dir)
+    keyboard = []
+    # 上级目录按钮（如果不是根前缀）
+    parent = os.path.dirname(current_dir)
+    if parent.startswith(ALLOWED_WORKDIR_PREFIX) and parent != current_dir:
+        keyboard.append([InlineKeyboardButton("📁 ..", callback_data=f"cd:{parent}")])
+    for d in dirs:
+        full = os.path.join(current_dir, d)
+        keyboard.append([InlineKeyboardButton(f"📂 {d}", callback_data=f"cd:{full}")])
+    if not keyboard:
+        keyboard.append([InlineKeyboardButton("（空目录）", callback_data="cd:noop")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def ls_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        return
+    current = get_user_workdir(user_id) or ALLOWED_WORKDIR_PREFIX
+    await update.message.reply_text(
+        f"当前目录：{current}",
+        reply_markup=_build_ls_keyboard(current),
+    )
+
+
+async def ls_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not is_allowed(user_id):
+        await query.answer("无权限。")
+        return
+
+    target = query.data.split(":", 1)[1]
+    if target == "noop":
+        await query.answer()
+        return
+
+    resolved = os.path.realpath(target)
+    if not resolved.startswith(ALLOWED_WORKDIR_PREFIX):
+        await query.answer("路径不在允许范围内。")
+        return
+    if not os.path.isdir(resolved):
+        await query.answer("目录不存在。")
+        return
+
+    await set_user_setting(user_id, "workdir", resolved)
+    await query.edit_message_text(
+        f"已切换到：{resolved}",
+        reply_markup=_build_ls_keyboard(resolved),
+    )
+    await query.answer(f"✅ {os.path.basename(resolved)}")
+
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("请在 .env 中设置 TELEGRAM_BOT_TOKEN")
@@ -1189,7 +1255,9 @@ def main():
     app.add_handler(CommandHandler("models", models))
     app.add_handler(CommandHandler("workdir", workdir))
     app.add_handler(CommandHandler("history", history))
+    app.add_handler(CommandHandler("ls", ls_cmd))
     app.add_handler(CallbackQueryHandler(models_callback, pattern=r"^model:"))
+    app.add_handler(CallbackQueryHandler(ls_callback, pattern=r"^cd:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot 启动，开始 polling...")
