@@ -3,9 +3,14 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    privileged: true
+    pid: host
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/node:/usr/bin/node:ro
       - /home/sikim/.npm-global:/home/sikim/.npm-global:ro
       - /home/sikim/.claude:/home/sikim/.claude
       - /home/sikim/project:/home/sikim/project
       - /srv/claudecode-chatbot:/srv/claudecode-chatbot
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
+      - /run/systemd/private:/run/systemd/private

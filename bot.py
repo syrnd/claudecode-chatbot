@@ -25,7 +25,7 @@ ALLOWED_USER_IDS = set(
 
 # claude CLI 路径和超时（默认10分钟）
 CLAUDE_CMD = os.getenv("CLAUDE_CMD", "/home/sikim/.npm-global/bin/claude")
-CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "600"))
+CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "3600"))
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
 TASK_QUIET_AFTER = int(os.getenv("TASK_QUIET_AFTER", "180"))
 TASK_STALLED_AFTER = int(os.getenv("TASK_STALLED_AFTER", "480"))
@@ -604,7 +604,7 @@ async def ask_claude(
                     if event.get("is_error"):
                         error_msg = result_text or "Claude 返回错误"
                         # 检查是否是 session 错误
-                        if "Invalid" in error_msg and user_sessions.get(user_id):
+                        if ("Invalid" in error_msg or "No conversation found" in error_msg) and user_sessions.get(user_id):
                             raise _SessionError(error_msg)
                         await update_task_state(
                             user_id,
