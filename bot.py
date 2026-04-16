@@ -525,9 +525,15 @@ async def ask_claude(
                     for block in content_blocks:
                         block_type = block.get("type")
 
-                        if block_type == "thinking" and not seen_thinking:
+                        if block_type == "thinking":
+                            thinking_text = block.get("thinking", "")
+                            if thinking_text:
+                                # 取思考内容的前 80 字符作为摘要
+                                preview = thinking_text.strip().replace("\n", " ")[:80]
+                                progress = f"思考中: {preview}..."
+                            else:
+                                progress = "Claude 正在思考..."
                             seen_thinking = True
-                            progress = "Claude 正在思考..."
                             await update_task_state(user_id, last_progress=progress)
                             await _maybe_update_status(progress)
 
