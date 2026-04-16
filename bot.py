@@ -475,8 +475,25 @@ async def ask_claude(
         last_status_update = 0.0
         STATUS_UPDATE_INTERVAL = 3.0  # Telegram 状态消息最小更新间隔
 
+        async def _maybe_update_status(progress: str):
+            """限频更新 Telegram 状态消息。"""
+            nonlocal last_status_update
+            now = now_ts()
+            if context and running_task and now - last_status_update >= STATUS_UPDATE_INTERVAL:
+                last_status_update = now
+                await update_status_message(
+                    context,
+                    running_task.status_message_chat_id,
+                    running_task.status_message_id,
+                    f"任务执行中...\n进度: {progress}\n摘要: {running_task.prompt_preview}",
+                )
+
         async def _read_stream():
             nonlocal result_text, session_id, last_status_update
+            seen_thinking = False
+            seen_text = False
+            turn_count = 0
+
             async for raw_line in process.stdout:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
@@ -494,30 +511,38 @@ async def ask_claude(
                 if event.get("session_id") and not session_id:
                     session_id = event["session_id"]
 
-                # 处理 assistant 消息：提取工具调用进度
+                # 处理 assistant 消息
                 if event_type == "assistant":
                     msg = event.get("message", {})
                     content_blocks = msg.get("content", [])
+
+                    # 检测新的 turn（stop_reason 非空说明该 turn 结束）
+                    if msg.get("stop_reason"):
+                        turn_count += 1
+                        seen_thinking = False
+                        seen_text = False
+
                     for block in content_blocks:
                         block_type = block.get("type")
-                        if block_type == "tool_use":
+
+                        if block_type == "thinking" and not seen_thinking:
+                            seen_thinking = True
+                            progress = "Claude 正在思考..."
+                            await update_task_state(user_id, last_progress=progress)
+                            await _maybe_update_status(progress)
+
+                        elif block_type == "tool_use":
                             tool_name = block.get("name", "?")
                             tool_input = block.get("input", {})
                             progress = _summarize_tool_use(tool_name, tool_input)
                             await update_task_state(user_id, last_progress=progress)
-                            # 限频更新 Telegram 状态消息
-                            now = now_ts()
-                            if context and running_task and now - last_status_update >= STATUS_UPDATE_INTERVAL:
-                                last_status_update = now
-                                await update_status_message(
-                                    context,
-                                    running_task.status_message_chat_id,
-                                    running_task.status_message_id,
-                                    f"任务执行中...\n进度: {progress}\n摘要: {running_task.prompt_preview}",
-                                )
-                        elif block_type == "text" and block.get("text"):
-                            # 文本回复片段，记录但不频繁更新
-                            pass
+                            await _maybe_update_status(progress)
+
+                        elif block_type == "text" and block.get("text") and not seen_text:
+                            seen_text = True
+                            progress = "Claude 正在回复..."
+                            await update_task_state(user_id, last_progress=progress)
+                            await _maybe_update_status(progress)
 
                 # 最终结果事件
                 elif event_type == "result":
