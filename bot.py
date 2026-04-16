@@ -635,7 +635,6 @@ async def ask_claude(
                 None,
             )
 
-        read_transport.close()
         # 等待进程退出
         await process.wait()
 
