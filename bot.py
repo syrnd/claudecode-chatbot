@@ -407,6 +407,7 @@ def build_claude_cmd(user_id: int, message: str) -> list[str]:
     session_id = user_sessions.get(user_id)
     model = get_user_model(user_id)
     cmd = [
+        "stdbuf", "-oL",  # 强制行缓冲，确保流式事件实时输出
         CLAUDE_CMD, "--dangerously-skip-permissions", "-p",
         "--output-format", "stream-json", "--verbose",
         "--model", model,
