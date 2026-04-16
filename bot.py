@@ -3,6 +3,7 @@ import contextlib
 import json
 import logging
 import os
+import shlex
 import tempfile
 import time
 import uuid
@@ -406,16 +407,17 @@ user_settings: dict[int, dict] = load_user_settings()
 def build_claude_cmd(user_id: int, message: str) -> list[str]:
     session_id = user_sessions.get(user_id)
     model = get_user_model(user_id)
-    cmd = [
-        "stdbuf", "-oL",  # 强制行缓冲，确保流式事件实时输出
+    inner = [
         CLAUDE_CMD, "--dangerously-skip-permissions", "-p",
         "--output-format", "stream-json", "--verbose",
         "--model", model,
     ]
     if session_id:
-        cmd += ["--resume", session_id]
-    cmd.append(message)
-    return cmd
+        inner += ["--resume", session_id]
+    inner.append(message)
+    # script -qec 提供 PTY，让 Node.js 使用行缓冲实时 flush 输出
+    shell_cmd = " ".join(shlex.quote(c) for c in inner)
+    return ["script", "-qec", shell_cmd, "/dev/null"]
 
 
 def _summarize_tool_use(name: str, input_data: dict) -> str:
@@ -496,7 +498,7 @@ async def ask_claude(
             turn_count = 0
 
             async for raw_line in process.stdout:
-                line = raw_line.decode("utf-8", errors="replace").strip()
+                line = raw_line.decode("utf-8", errors="replace").replace("\r", "").strip()
                 if not line:
                     continue
                 collected_lines.append(line)
