@@ -1175,24 +1175,31 @@ async def workdir(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _list_dirs(path: str) -> list[str]:
     """列出目录下的子目录，按名称排序。"""
     try:
-        return sorted(
-            d for d in os.listdir(path)
-            if os.path.isdir(os.path.join(path, d)) and not d.startswith(".")
-        )
+        entries = []
+        for name in sorted(os.listdir(path)):
+            full = os.path.join(path, name)
+            if os.path.isdir(full):
+                entries.append(("dir", name))
+            else:
+                entries.append(("file", name))
+        return entries
     except OSError:
         return []
 
 
 def _build_ls_keyboard(current_dir: str) -> InlineKeyboardMarkup:
-    dirs = _list_dirs(current_dir)
+    entries = _list_dirs(current_dir)
     keyboard = []
     # 上级目录按钮
     parent = os.path.dirname(current_dir)
     if parent != current_dir:
         keyboard.append([InlineKeyboardButton("📁 ..", callback_data=f"cd:{parent}")])
-    for d in dirs:
-        full = os.path.join(current_dir, d)
-        keyboard.append([InlineKeyboardButton(f"📂 {d}", callback_data=f"cd:{full}")])
+    for kind, name in entries:
+        if kind == "dir":
+            full = os.path.join(current_dir, name)
+            keyboard.append([InlineKeyboardButton(f"📂 {name}", callback_data=f"cd:{full}")])
+        else:
+            keyboard.append([InlineKeyboardButton(f"📄 {name}", callback_data="cd:noop")])
     if not keyboard:
         keyboard.append([InlineKeyboardButton("（空目录）", callback_data="cd:noop")])
     return InlineKeyboardMarkup(keyboard)
