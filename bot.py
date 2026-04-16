@@ -1190,9 +1190,9 @@ def _list_dirs(path: str) -> list[str]:
 def _build_ls_keyboard(current_dir: str) -> InlineKeyboardMarkup:
     entries = _list_dirs(current_dir)
     keyboard = []
-    # 上级目录按钮
+    # 上级目录按钮（只在允许范围内时显示）
     parent = os.path.dirname(current_dir)
-    if parent != current_dir:
+    if parent != current_dir and os.path.realpath(parent).startswith(ALLOWED_WORKDIR_PREFIX):
         keyboard.append([InlineKeyboardButton("📁 ..", callback_data=f"cd:{parent}")])
     for kind, name in entries:
         if kind == "dir":
