@@ -3,6 +3,7 @@ import contextlib
 import json
 import logging
 import os
+import pty
 import shlex
 import tempfile
 import time
@@ -407,17 +408,15 @@ user_settings: dict[int, dict] = load_user_settings()
 def build_claude_cmd(user_id: int, message: str) -> list[str]:
     session_id = user_sessions.get(user_id)
     model = get_user_model(user_id)
-    inner = [
+    cmd = [
         CLAUDE_CMD, "--dangerously-skip-permissions", "-p",
         "--output-format", "stream-json", "--verbose",
         "--model", model,
     ]
     if session_id:
-        inner += ["--resume", session_id]
-    inner.append(message)
-    # script -qec 提供 PTY，让 Node.js 使用行缓冲实时 flush 输出
-    shell_cmd = " ".join(shlex.quote(c) for c in inner)
-    return ["script", "-qec", shell_cmd, "/dev/null"]
+        cmd += ["--resume", session_id]
+    cmd.append(message)
+    return cmd
 
 
 def _summarize_tool_use(name: str, input_data: dict) -> str:
@@ -457,12 +456,25 @@ async def ask_claude(
     try:
         logger.info("starting claude task user=%d timeout=%ds", user_id, CLAUDE_TIMEOUT)
         workdir = get_user_workdir(user_id)
+
+        # PTY を使って Node.js に TTY 環境を提供し、行バッファリングを強制
+        master_fd, slave_fd = pty.openpty()
         process = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=slave_fd,
             stderr=asyncio.subprocess.PIPE,
             cwd=workdir,
         )
+        os.close(slave_fd)  # 子进程已继承，父进程关闭 slave 端
+
+        # 将 master fd 注册到 asyncio 事件循环
+        loop = asyncio.get_event_loop()
+        master_reader = asyncio.StreamReader()
+        read_transport, _ = await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(master_reader),
+            os.fdopen(master_fd, "rb", 0),
+        )
+
         running_task = active_tasks.get(user_id)
         if running_task:
             running_task.process = process
@@ -497,7 +509,13 @@ async def ask_claude(
             seen_text = False
             turn_count = 0
 
-            async for raw_line in process.stdout:
+            while True:
+                try:
+                    raw_line = await master_reader.readline()
+                except (asyncio.IncompleteReadError, ConnectionResetError, OSError):
+                    break
+                if not raw_line:
+                    break
                 line = raw_line.decode("utf-8", errors="replace").replace("\r", "").strip()
                 if not line:
                     continue
@@ -582,6 +600,7 @@ async def ask_claude(
         try:
             await asyncio.wait_for(_read_stream(), timeout=CLAUDE_TIMEOUT)
         except asyncio.TimeoutError:
+            read_transport.close()
             if process and process.returncode is None:
                 process.kill()
                 with contextlib.suppress(Exception):
@@ -600,6 +619,7 @@ async def ask_claude(
                 None,
             )
 
+        read_transport.close()
         # 等待进程退出
         await process.wait()
 
