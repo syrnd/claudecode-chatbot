@@ -36,6 +36,7 @@ Telegram 経由で Claude Code CLI を操作するボットです。
 - `/model [alias]` — モデルの確認・切替（略称：sonnet / opus / haiku）
 - `/models` — 利用可能なモデル一覧（InlineKeyboard で選択）
 - `/workdir [path]` — 作業ディレクトリの確認・切替（許可されたパスプレフィックス内のみ）
+- `/ls` — プロジェクトディレクトリを一覧表示（タップで切替）
 - `/history [n]` — 最近 n 件のタスク履歴を表示（デフォルト 5、最大 20）
 
 テキストメッセージを送信すると、新しいタスクとして Claude Code に送られます。
@@ -75,7 +76,7 @@ Telegram 経由で Claude Code CLI を操作するボットです。
 
 - `ALLOWED_USER_IDS` — 許可するユーザーID（カンマ区切り）
 - `CLAUDE_CMD` — Claude Code CLI パス
-- `CLAUDE_TIMEOUT` — タスクの最大実行時間（秒、デフォルト 600）
+- `CLAUDE_TIMEOUT` — タスクの最大実行時間（秒、デフォルト 3600）
 - `MAX_CONCURRENT_TASKS` — 最大同時実行タスク数（デフォルト 2）
 - `TASK_QUIET_AFTER` — quiet 判定閾値（秒、デフォルト 180）
 - `TASK_STALLED_AFTER` — stalled 判定閾値（秒、デフォルト 480）
@@ -166,6 +167,7 @@ sudo systemctl restart claudecode-chatbot.service
 - `/model [alias]` — 查看或切换模型（可用简写：sonnet / opus / haiku）
 - `/models` — 显示可用模型列表（InlineKeyboard 选择）
 - `/workdir [path]` — 查看或切换工作目录（限制在允许的路径前缀下）
+- `/ls` — 浏览项目目录（点击切换工作目录）
 - `/history [n]` — 查看最近 n 个任务历史（默认 5，最多 20）
 
 直接发送文本消息即可创建新任务。
@@ -205,7 +207,7 @@ sudo systemctl restart claudecode-chatbot.service
 
 - `ALLOWED_USER_IDS` — 允许的用户 ID（逗号分隔）
 - `CLAUDE_CMD` — Claude Code CLI 路径
-- `CLAUDE_TIMEOUT` — 单个任务最长执行时间（秒，默认 600）
+- `CLAUDE_TIMEOUT` — 单个任务最长执行时间（秒，默认 3600）
 - `MAX_CONCURRENT_TASKS` — 同时最多运行多少个任务（默认 2）
 - `TASK_QUIET_AFTER` — quiet 判定阈值（秒，默认 180）
 - `TASK_STALLED_AFTER` — stalled 判定阈值（秒，默认 480）
