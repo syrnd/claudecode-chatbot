@@ -457,7 +457,7 @@ async def ask_claude(
         logger.info("starting claude task user=%d timeout=%ds", user_id, CLAUDE_TIMEOUT)
         workdir = get_user_workdir(user_id)
 
-        # PTY を使って Node.js に TTY 環境を提供し、行バッファリングを強制
+        # PTY で Node.js に TTY 環境を提供し、行バッファリングを強制
         master_fd, slave_fd = pty.openpty()
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -467,13 +467,33 @@ async def ask_claude(
         )
         os.close(slave_fd)  # 子进程已继承，父进程关闭 slave 端
 
-        # 将 master fd 注册到 asyncio 事件循环
+        # スレッドで master fd から行単位で読み取るキュー
+        line_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        def _pty_reader():
+            """在后台线程中从 PTY master fd 逐行读取。"""
+            buf = b""
+            try:
+                while True:
+                    try:
+                        chunk = os.read(master_fd, 8192)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        asyncio.run_coroutine_threadsafe(
+                            line_queue.put(line), loop
+                        )
+            finally:
+                asyncio.run_coroutine_threadsafe(line_queue.put(None), loop)
+                with contextlib.suppress(OSError):
+                    os.close(master_fd)
+
         loop = asyncio.get_event_loop()
-        master_reader = asyncio.StreamReader()
-        read_transport, _ = await loop.connect_read_pipe(
-            lambda: asyncio.StreamReaderProtocol(master_reader),
-            os.fdopen(master_fd, "rb", 0),
-        )
+        reader_thread = asyncio.get_event_loop().run_in_executor(None, _pty_reader)
 
         running_task = active_tasks.get(user_id)
         if running_task:
@@ -510,11 +530,8 @@ async def ask_claude(
             turn_count = 0
 
             while True:
-                try:
-                    raw_line = await master_reader.readline()
-                except (asyncio.IncompleteReadError, ConnectionResetError, OSError):
-                    break
-                if not raw_line:
+                raw_line = await line_queue.get()
+                if raw_line is None:
                     break
                 line = raw_line.decode("utf-8", errors="replace").replace("\r", "").strip()
                 if not line:
@@ -600,7 +617,6 @@ async def ask_claude(
         try:
             await asyncio.wait_for(_read_stream(), timeout=CLAUDE_TIMEOUT)
         except asyncio.TimeoutError:
-            read_transport.close()
             if process and process.returncode is None:
                 process.kill()
                 with contextlib.suppress(Exception):
