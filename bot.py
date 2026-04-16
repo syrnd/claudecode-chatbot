@@ -506,6 +506,14 @@ async def ask_claude(
                     continue
 
                 event_type = event.get("type")
+                event_subtype = event.get("subtype", "")
+                # debug: 记录每个事件类型
+                if event_type == "assistant":
+                    msg = event.get("message", {})
+                    blocks = [b.get("type") for b in msg.get("content", [])]
+                    logger.info("stream event: type=%s blocks=%s", event_type, blocks)
+                elif event_type != "system":
+                    logger.info("stream event: type=%s subtype=%s", event_type, event_subtype)
 
                 # 提取 session_id（多个事件都可能包含）
                 if event.get("session_id") and not session_id:
