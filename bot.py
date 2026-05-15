@@ -14,7 +14,9 @@ from threading import Lock
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -37,6 +39,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# httpx INFO ログは getUpdates URL にトークンを含むため抑制
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Session 持久化文件
@@ -1244,6 +1249,14 @@ async def ls_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer(f"✅ {os.path.basename(resolved)}")
 
 
+async def network_error_handler(update, context):
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning("ネットワーク一時障害 (PTB が自動再接続): %s: %s", type(err).__name__, err)
+        return
+    logger.error("未処理例外", exc_info=err)
+
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("请在 .env 中设置 TELEGRAM_BOT_TOKEN")
@@ -1251,7 +1264,31 @@ def main():
         raise SystemExit("ALLOWED_USER_IDS 未配置，拒绝启动（安全风险：任何人均可操控此 bot）")
 
     cleanup_old_logs()
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # getUpdates 用は long-poll 30s + 余裕 10s 想定で read_timeout=40s
+    get_updates_request = HTTPXRequest(
+        connection_pool_size=1,
+        connect_timeout=15.0,
+        read_timeout=40.0,
+        write_timeout=15.0,
+        pool_timeout=5.0,
+    )
+    # 通常 API 呼び出し用
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=15.0,
+        read_timeout=15.0,
+        write_timeout=15.0,
+        pool_timeout=5.0,
+    )
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .get_updates_request(get_updates_request)
+        .build()
+    )
+    app.add_error_handler(network_error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reset", reset))
@@ -1268,7 +1305,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot 启动，开始 polling...")
-    app.run_polling()
+    app.run_polling(timeout=30)
 
 
 if __name__ == "__main__":
