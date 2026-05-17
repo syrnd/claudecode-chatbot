@@ -654,6 +654,8 @@ async def ask_claude(
                 stderr_bytes = await process.stderr.read()
                 stderr = stderr_bytes.decode("utf-8", errors="replace")
             logger.error("claude stderr: %s", stderr)
+            if ("No conversation found" in stderr or "Invalid" in stderr) and user_sessions.get(user_id):
+                raise _SessionError(stderr)
             await update_task_state(
                 user_id,
                 status="error",
