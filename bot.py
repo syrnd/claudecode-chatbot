@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import pty
-import shlex
 import tempfile
 import time
 import uuid
@@ -25,7 +24,7 @@ ALLOWED_USER_IDS = set(
     int(uid.strip()) for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") if uid.strip()
 )
 
-# claude CLI 路径和超时（默认10分钟）
+# claude CLI 路径和超时（默认60分钟）
 CLAUDE_CMD = os.getenv("CLAUDE_CMD", "/home/sikim/.npm-global/bin/claude")
 CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "3600"))
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
@@ -34,6 +33,8 @@ TASK_STALLED_AFTER = int(os.getenv("TASK_STALLED_AFTER", "480"))
 STALL_CHECK_INTERVAL = int(os.getenv("STALL_CHECK_INTERVAL", "60"))
 TASK_LOG_RETENTION_DAYS = int(os.getenv("TASK_LOG_RETENTION_DAYS", "7"))
 ALLOWED_WORKDIR_PREFIX = os.getenv("ALLOWED_WORKDIR_PREFIX", "/home/sikim/project")
+# long（1M コンテキスト）版があれば優先する。使えないモデルは実行時に自動フォールバック。
+PREFER_LONG_CONTEXT = os.getenv("PREFER_LONG_CONTEXT", "1").lower() not in ("0", "false", "no", "")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -52,17 +53,22 @@ sessions_lock = Lock()
 task_state_lock = Lock()
 user_settings_lock = Lock()
 
+# Claude CLI のファミリーエイリアス。CLI が各系列を常に最新版へ自動解決するため、
+# 新モデル（例: Opus 4.9 / 5.0）が出てもこのリストを更新する必要はない。
 AVAILABLE_MODELS = [
-    ("claude-sonnet-4-6", "Sonnet 4.6"),
-    ("claude-opus-4-6", "Opus 4.6"),
-    ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+    ("opus", "Opus（最新）"),
+    ("sonnet", "Sonnet（最新）"),
+    ("haiku", "Haiku（最新）"),
 ]
-MODEL_ALIASES = {
-    "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
+# 旧バージョン固定ID → ファミリーエイリアスへの正規化（既存設定の移行用）。
+# 固定IDのままだと古い版に張り付くため、読み込み時に最新追従のエイリアスへ変換する。
+LEGACY_MODEL_MAP = {
+    "claude-sonnet-4-6": "sonnet",
+    "claude-opus-4-6": "opus",
+    "claude-opus-4-8": "opus",
+    "claude-haiku-4-5-20251001": "haiku",
 }
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "opus"
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 
@@ -118,11 +124,19 @@ def save_user_settings(settings: dict[int, dict]):
 
 
 def get_user_model(user_id: int) -> str:
-    return user_settings.get(user_id, {}).get("model", DEFAULT_MODEL)
+    model = user_settings.get(user_id, {}).get("model", DEFAULT_MODEL)
+    # 旧バージョン固定IDは最新追従のファミリーエイリアスへ正規化
+    return LEGACY_MODEL_MAP.get(model, model)
 
 
 def get_user_workdir(user_id: int) -> str | None:
     return user_settings.get(user_id, {}).get("workdir")
+
+
+def _is_within_allowed(resolved: str) -> bool:
+    """realpath 済みパスが許可ディレクトリ配下か厳密判定（兄弟ディレクトリのすり抜け防止）。"""
+    prefix = ALLOWED_WORKDIR_PREFIX
+    return resolved == prefix or resolved.startswith(prefix + os.sep)
 
 
 async def set_user_setting(user_id: int, key: str, value):
@@ -410,13 +424,29 @@ user_sessions: dict[int, str] = load_sessions()
 user_settings: dict[int, dict] = load_user_settings()
 
 
+# 1M（long）コンテキストが使えないと実行時に判明したモデルを記録（自動フォールバック用）
+_long_unavailable: set[str] = set()
+
+
+def _cli_model(model: str) -> str:
+    """--model に渡す実際の値。long 優先なら [1m] を付与する。"""
+    if not PREFER_LONG_CONTEXT or "[" in model or model in _long_unavailable:
+        return model
+    return f"{model}[1m]"
+
+
+def _is_long_credit_error(text: str) -> bool:
+    """1M クレジット不足エラーの判定。"""
+    return "1M" in text and "credit" in text.lower()
+
+
 def build_claude_cmd(user_id: int, message: str) -> list[str]:
     session_id = user_sessions.get(user_id)
     model = get_user_model(user_id)
     cmd = [
         CLAUDE_CMD, "--dangerously-skip-permissions", "-p",
         "--output-format", "stream-json", "--verbose",
-        "--model", model,
+        "--model", _cli_model(model),
     ]
     if session_id:
         cmd += ["--resume", session_id]
@@ -455,6 +485,8 @@ async def ask_claude(
     _retry: int = 0,
 ) -> tuple[str, str | None]:
     cmd = build_claude_cmd(user_id, message)
+    # この実行で 1M（long）版を使っているか（フォールバック判定用）
+    used_long = _cli_model(get_user_model(user_id)).endswith("[1m]")
     process = None
     collected_lines = []
 
@@ -608,6 +640,9 @@ async def ask_claude(
                     # 检查是否是错误结果
                     if event.get("is_error"):
                         error_msg = result_text or "Claude 返回错误"
+                        # 1M（long）が使えない → 通常版へフォールバックして再試行
+                        if _is_long_credit_error(error_msg) and used_long:
+                            raise _LongContextError(error_msg)
                         # 检查是否是 session 错误
                         if ("Invalid" in error_msg or "No conversation found" in error_msg) and user_sessions.get(user_id):
                             raise _SessionError(error_msg)
@@ -654,6 +689,8 @@ async def ask_claude(
                 stderr_bytes = await process.stderr.read()
                 stderr = stderr_bytes.decode("utf-8", errors="replace")
             logger.error("claude stderr: %s", stderr)
+            if _is_long_credit_error(stderr) and used_long:
+                raise _LongContextError(stderr)
             if ("No conversation found" in stderr or "Invalid" in stderr) and user_sessions.get(user_id):
                 raise _SessionError(stderr)
             await update_task_state(
@@ -668,6 +705,12 @@ async def ask_claude(
         logger.info("claude task finished user=%d returncode=%s", user_id, process.returncode)
         return result_text or "（无回复）", session_id
 
+    except _LongContextError as e:
+        base_model = get_user_model(user_id)
+        _long_unavailable.add(base_model)
+        logger.warning("1M unavailable for %s, falling back to standard context: %s", base_model, str(e)[:200])
+        # _long_unavailable に登録済みのため、再帰呼び出しでは [1m] が付かない
+        return await ask_claude(user_id, message, context, _retry)
     except _SessionError as e:
         logger.warning("session error detected, clearing session and retrying: %s", str(e)[:200])
         user_sessions.pop(user_id, None)
@@ -703,6 +746,11 @@ async def ask_claude(
 
 class _SessionError(Exception):
     """内部异常：session 无效需要重试。"""
+    pass
+
+
+class _LongContextError(Exception):
+    """内部异常：1M（long）コンテキストが使えないため通常版で再試行。"""
     pass
 
 
@@ -939,7 +987,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/logs [n] — 查看最近 n 条任务日志（默认 8）\n"
         "/cancel — 取消当前任务\n"
         "/reset — 重置 Claude 会话\n"
-        "/model [alias] — 查看或切换模型（sonnet/opus/haiku）\n"
+        "/model [opus|sonnet|haiku] — 查看或切换模型（自动使用各系列最新版）\n"
         "/models — 显示可用模型列表\n"
         "/workdir [path] — 查看或切换工作目录\n"
         "/ls — 浏览项目目录（点击切换）\n"
@@ -967,7 +1015,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = update.message.text
-    logger.info("user=%d msg_preview=%s", user_id, user_text[:80])
+    # メッセージ本文は magic-link 等の秘密を含み得るため INFO では長さのみ記録
+    logger.info("user=%d msg_len=%d", user_id, len(user_text))
     logger.debug("user=%d full_prompt=%s", user_id, user_text)
 
     if user_id in active_tasks:
@@ -1062,14 +1111,23 @@ async def model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"当前模型：{current_name}\n用 /models 查看可用模型列表。")
         return
 
-    alias = context.args[0].lower()
-    model_id = MODEL_ALIASES.get(alias, alias)
-    model_name = next((name for mid, name in AVAILABLE_MODELS if mid == model_id), None)
-    if not model_name:
-        aliases = ", ".join(MODEL_ALIASES.keys())
-        await update.message.reply_text(f"未知模型：{alias}\n可用简写：{aliases}")
+    alias = context.args[0].strip().lower()
+    valid_aliases = {mid for mid, _ in AVAILABLE_MODELS}
+    if alias in valid_aliases:
+        model_id = alias
+    elif alias in LEGACY_MODEL_MAP:
+        model_id = LEGACY_MODEL_MAP[alias]
+    elif alias.startswith("claude-"):
+        # 将来モデルや特定版の固定指定をパススルー受理（CLI が検証する）
+        model_id = alias
+    else:
+        names = ", ".join(mid for mid, _ in AVAILABLE_MODELS)
+        await update.message.reply_text(
+            f"未知模型：{alias}\n可用：{names}（或 claude-<完整模型ID>）"
+        )
         return
 
+    model_name = next((name for mid, name in AVAILABLE_MODELS if mid == model_id), model_id)
     await set_user_setting(user_id, "model", model_id)
     await update.message.reply_text(f"已切换到 {model_name}。")
 
@@ -1166,7 +1224,7 @@ async def workdir(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     path = " ".join(context.args)
     resolved = os.path.realpath(path)
-    if not resolved.startswith(ALLOWED_WORKDIR_PREFIX):
+    if not _is_within_allowed(resolved):
         await update.message.reply_text(
             f"只允许在 {ALLOWED_WORKDIR_PREFIX} 下的目录中工作。"
         )
@@ -1199,7 +1257,7 @@ def _build_ls_keyboard(current_dir: str) -> InlineKeyboardMarkup:
     keyboard = []
     # 上级目录按钮（只在允许范围内时显示）
     parent = os.path.dirname(current_dir)
-    if parent != current_dir and os.path.realpath(parent).startswith(ALLOWED_WORKDIR_PREFIX):
+    if parent != current_dir and _is_within_allowed(os.path.realpath(parent)):
         keyboard.append([InlineKeyboardButton("📁 ..", callback_data=f"cd:{parent}")])
     for kind, name in entries:
         if kind == "dir":
@@ -1236,7 +1294,7 @@ async def ls_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     resolved = os.path.realpath(target)
-    if not resolved.startswith(ALLOWED_WORKDIR_PREFIX):
+    if not _is_within_allowed(resolved):
         await query.answer("路径不在允许范围内。")
         return
     if not os.path.isdir(resolved):
