@@ -33,6 +33,11 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            set -e
             cd /srv/claudecode-chatbot
-            git pull origin master
+            # デプロイ先のローカル編集に阻まれないよう pull ではなく fetch + reset を使う
+            # （デプロイ先は直接編集しない運用。過去に pull が黙って失敗し古いコードのまま
+            #   再起動される事故があったため、途中失敗は set -e でジョブを赤にする）
+            git fetch origin master
+            git reset --hard origin/master
             docker compose up -d --build
