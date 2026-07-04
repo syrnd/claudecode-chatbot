@@ -1,5 +1,7 @@
 import asyncio
 import contextlib
+import hashlib
+import io
 import json
 import logging
 import os
@@ -13,7 +15,7 @@ from threading import Lock
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import NetworkError, TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
@@ -56,6 +58,7 @@ user_settings_lock = Lock()
 # Claude CLI のファミリーエイリアス。CLI が各系列を常に最新版へ自動解決するため、
 # 新モデル（例: Opus 4.9 / 5.0）が出てもこのリストを更新する必要はない。
 AVAILABLE_MODELS = [
+    ("fable", "Fable（最上位・最新）"),
     ("opus", "Opus（最新）"),
     ("sonnet", "Sonnet（最新）"),
     ("haiku", "Haiku（最新）"),
@@ -139,11 +142,26 @@ def _is_within_allowed(resolved: str) -> bool:
     return resolved == prefix or resolved.startswith(prefix + os.sep)
 
 
+# スナップショット取得〜書き込み完了までを直列化し、
+# 古いスナップショットが新しい書き込みを後から上書きするのを防ぐ
+_user_settings_save_lock = asyncio.Lock()
+_sessions_save_lock = asyncio.Lock()
+
+
 async def set_user_setting(user_id: int, key: str, value):
     if user_id not in user_settings:
         user_settings[user_id] = {}
     user_settings[user_id][key] = value
-    await asyncio.to_thread(save_user_settings, user_settings)
+    async with _user_settings_save_lock:
+        # ワーカースレッドでのシリアライズ中にイベントループ側が dict を変更しないよう、
+        # スナップショットを渡す
+        snapshot = {k: dict(v) for k, v in user_settings.items()}
+        await asyncio.to_thread(save_user_settings, snapshot)
+
+
+async def persist_sessions():
+    async with _sessions_save_lock:
+        await asyncio.to_thread(save_sessions, dict(user_sessions))
 
 
 def save_sessions(sessions: dict[int, str]):
@@ -329,11 +347,15 @@ async def update_task_state(
     if stalled_notified is not None:
         state["stalled_notified"] = stalled_notified
 
-    await asyncio.to_thread(save_task_state, state)
-    if finished:
-        append_history(state)
-    if last_progress:
-        append_task_log(str(state["task_id"]), last_progress)
+    def _persist():
+        save_task_state(state)
+        if finished:
+            append_history(state)
+        if last_progress:
+            append_task_log(str(state["task_id"]), last_progress)
+
+    # fsync を伴うファイル I/O はイベントループをブロックしないようスレッドで実行
+    await asyncio.to_thread(_persist)
     return state
 
 
@@ -440,6 +462,18 @@ def _is_long_credit_error(text: str) -> bool:
     return "1M" in text and "credit" in text.lower()
 
 
+def _is_session_error(text: str) -> bool:
+    """session が無効／見つからない類のエラーか。
+
+    'Invalid API key' 等の無関係なエラーでセッションを破棄して全再実行
+    しないよう、session 文脈を伴うものだけに限定する。
+    """
+    lowered = text.lower()
+    return "no conversation found" in lowered or (
+        "session" in lowered and "invalid" in lowered
+    )
+
+
 def build_claude_cmd(user_id: int, message: str) -> list[str]:
     session_id = user_sessions.get(user_id)
     model = get_user_model(user_id)
@@ -488,6 +522,7 @@ async def ask_claude(
     # この実行で 1M（long）版を使っているか（フォールバック判定用）
     used_long = _cli_model(get_user_model(user_id)).endswith("[1m]")
     process = None
+    stderr_task: asyncio.Task | None = None
     collected_lines = []
 
     try:
@@ -503,6 +538,26 @@ async def ask_claude(
             cwd=workdir,
         )
         os.close(slave_fd)  # 子进程已继承，父进程关闭 slave 端
+
+        # stderr はパイプバッファ（64KB）詰まりで子プロセスがブロックしないよう常時排出する
+        stderr_chunks: list[bytes] = []
+        stderr_total = 0
+
+        async def _drain_stderr():
+            nonlocal stderr_total
+            if not process.stderr:
+                return
+            while True:
+                chunk = await process.stderr.read(8192)
+                if not chunk:
+                    break
+                stderr_chunks.append(chunk)
+                stderr_total += len(chunk)
+                # 保持は末尾 64KB 程度まで（エラー表示用途には十分）
+                while stderr_total > 65536 and len(stderr_chunks) > 1:
+                    stderr_total -= len(stderr_chunks.pop(0))
+
+        stderr_task = asyncio.create_task(_drain_stderr())
 
         # スレッドで master fd から行単位で読み取るキュー
         line_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
@@ -521,16 +576,24 @@ async def ask_claude(
                     buf += chunk
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
-                        asyncio.run_coroutine_threadsafe(
-                            line_queue.put(line), loop
-                        )
+                        try:
+                            loop.call_soon_threadsafe(line_queue.put_nowait, line)
+                        except RuntimeError:
+                            return  # イベントループ停止中（finally で番兵送信を試みる）
             finally:
-                asyncio.run_coroutine_threadsafe(line_queue.put(None), loop)
+                try:
+                    # put_nowait は無制限キューでは失敗しないため、番兵の送達は
+                    # ループが生きている限り保証される（run_coroutine_threadsafe だと
+                    # 例外時に番兵が失われ _read_stream がタイムアウトまでハングする）
+                    loop.call_soon_threadsafe(line_queue.put_nowait, None)
+                except RuntimeError:
+                    # イベントループ停止中：コンシューマも終了済みのため無視
+                    logger.warning("pty reader: event loop closed, sentinel dropped")
                 with contextlib.suppress(OSError):
                     os.close(master_fd)
 
-        loop = asyncio.get_event_loop()
-        reader_thread = asyncio.get_event_loop().run_in_executor(None, _pty_reader)
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _pty_reader)
 
         running_task = active_tasks.get(user_id)
         if running_task:
@@ -644,7 +707,7 @@ async def ask_claude(
                         if _is_long_credit_error(error_msg) and used_long:
                             raise _LongContextError(error_msg)
                         # 检查是否是 session 错误
-                        if ("Invalid" in error_msg or "No conversation found" in error_msg) and user_sessions.get(user_id):
+                        if _is_session_error(error_msg) and user_sessions.get(user_id):
                             raise _SessionError(error_msg)
                         await update_task_state(
                             user_id,
@@ -680,18 +743,17 @@ async def ask_claude(
 
         if session_id:
             user_sessions[user_id] = session_id
-            await asyncio.to_thread(save_sessions, user_sessions)
+            await persist_sessions()
             await update_task_state(user_id, session_id=session_id)
 
         if not result_text and process.returncode != 0:
-            stderr = ""
-            if process.stderr:
-                stderr_bytes = await process.stderr.read()
-                stderr = stderr_bytes.decode("utf-8", errors="replace")
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stderr_task, timeout=5)
+            stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
             logger.error("claude stderr: %s", stderr)
             if _is_long_credit_error(stderr) and used_long:
                 raise _LongContextError(stderr)
-            if ("No conversation found" in stderr or "Invalid" in stderr) and user_sessions.get(user_id):
+            if _is_session_error(stderr) and user_sessions.get(user_id):
                 raise _SessionError(stderr)
             await update_task_state(
                 user_id,
@@ -714,7 +776,7 @@ async def ask_claude(
     except _SessionError as e:
         logger.warning("session error detected, clearing session and retrying: %s", str(e)[:200])
         user_sessions.pop(user_id, None)
-        await asyncio.to_thread(save_sessions, user_sessions)
+        await persist_sessions()
         if _retry >= 1:
             logger.error("session retry exceeded, giving up")
             await update_task_state(
@@ -742,6 +804,18 @@ async def ask_claude(
             finished=True,
         )
         return f"发生错误：{e}", None
+    finally:
+        # どの経路（成功・タイムアウト・キャンセル・リトライ再帰）でも
+        # 子プロセスと stderr 排出タスクを確実に回収する
+        if process and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            with contextlib.suppress(Exception):
+                await process.wait()
+        if stderr_task is not None and not stderr_task.done():
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await stderr_task
 
 
 class _SessionError(Exception):
@@ -754,6 +828,11 @@ class _LongContextError(Exception):
     pass
 
 
+def _tg_len(text: str) -> int:
+    """Telegram の 4096 上限は UTF-16 コードユニット単位（絵文字等は 2 単位）。"""
+    return len(text.encode("utf-16-le")) // 2
+
+
 async def send_message_chunked(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -761,22 +840,25 @@ async def send_message_chunked(
     max_length: int = 4000,
 ):
     # 超长输出以文件形式发送
-    if len(text) > max_length * 3:
-        import io
+    if _tg_len(text) > max_length * 3:
         doc = io.BytesIO(text.encode("utf-8"))
         doc.name = "output.txt"
         await context.bot.send_document(chat_id=chat_id, document=doc)
         return
 
-    # 优先在换行符处切分
+    # 优先在换行符处切分（长度按 UTF-16 单位计算）
     chunks = []
     while text:
-        if len(text) <= max_length:
+        if _tg_len(text) <= max_length:
             chunks.append(text)
             break
-        split_at = text.rfind("\n", 0, max_length)
+        # コードポイント数 <= UTF-16 単位数なので max_length 文字から始めて縮めれば必ず収まる
+        window = text[:max_length]
+        while _tg_len(window) > max_length:
+            window = window[:-64]
+        split_at = window.rfind("\n")
         if split_at <= 0:
-            split_at = max_length
+            split_at = max(len(window), 1)
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
 
@@ -912,7 +994,8 @@ async def run_claude_task(
             running.status_message_id,
             summary,
         )
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+        # Telegram の 4096 文字上限を超える返信もチャンク分割／ファイル化して届ける
+        await send_message_chunked(context, update.effective_chat.id, reply)
         logger.info("task delivered user=%d elapsed=%ds", user_id, elapsed)
     except asyncio.CancelledError:
         await update_task_state(
@@ -987,7 +1070,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/logs [n] — 查看最近 n 条任务日志（默认 8）\n"
         "/cancel — 取消当前任务\n"
         "/reset — 重置 Claude 会话\n"
-        "/model [opus|sonnet|haiku] — 查看或切换模型（自动使用各系列最新版）\n"
+        "/model [fable|opus|sonnet|haiku] — 查看或切换模型（自动使用各系列最新版）\n"
         "/models — 显示可用模型列表\n"
         "/workdir [path] — 查看或切换工作目录\n"
         "/ls — 浏览项目目录（点击切换）\n"
@@ -1004,7 +1087,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("当前有运行中的任务，先用 /cancel 取消后再重置。")
         return
     user_sessions.pop(user_id, None)
-    await asyncio.to_thread(save_sessions, user_sessions)
+    await persist_sessions()
     await update.message.reply_text("对话已重置，开始新会话。")
 
 
@@ -1028,7 +1111,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thinking_msg = await update.message.reply_text("任务已接收，准备启动...")
     prompt_preview = user_text.strip().replace("\n", " ")[:120] or "（空消息）"
     task_id = uuid.uuid4().hex[:12]
-    create_task_state(user_id, user_text, prompt_preview, task_id)
+    await asyncio.to_thread(create_task_state, user_id, user_text, prompt_preview, task_id)
     task = asyncio.create_task(run_claude_task(update, context, user_id, user_text))
     active_tasks[user_id] = RunningTask(
         task=task,
@@ -1132,22 +1215,30 @@ async def model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"已切换到 {model_name}。")
 
 
-async def models(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_allowed(user_id):
-        return
+def _raise_unless_not_modified(e: BadRequest):
+    """内容未变化时 Telegram 返回 "message is not modified"，忽略；其余 BadRequest 重新抛出。"""
+    if "not modified" not in str(e).lower():
+        raise e
 
-    current = get_user_model(user_id)
-    keyboard = [
+
+def _build_models_keyboard(current: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"{'✅ ' if mid == current else ''}{name}",
             callback_data=f"model:{mid}"
         )]
         for mid, name in AVAILABLE_MODELS
-    ]
+    ])
+
+
+async def models(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        return
+
     await update.message.reply_text(
         "选择模型：",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=_build_models_keyboard(get_user_model(user_id)),
     )
 
 
@@ -1165,18 +1256,14 @@ async def models_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await set_user_setting(user_id, "model", model_id)
-    keyboard = [
-        [InlineKeyboardButton(
-            f"{'✅ ' if mid == model_id else ''}{name}",
-            callback_data=f"model:{mid}"
-        )]
-        for mid, name in AVAILABLE_MODELS
-    ]
-    await query.edit_message_text(
-        f"已切换到 {model_name}。",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
     await query.answer()
+    try:
+        await query.edit_message_text(
+            f"已切换到 {model_name}。",
+            reply_markup=_build_models_keyboard(model_id),
+        )
+    except BadRequest as e:
+        _raise_unless_not_modified(e)
 
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1237,8 +1324,8 @@ async def workdir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"工作目录已切换到：{resolved}")
 
 
-def _list_dirs(path: str) -> list[str]:
-    """列出目录下的子目录，按名称排序。"""
+def _list_entries(path: str) -> list[tuple[str, str]]:
+    """列出目录下的条目（目录与文件），按名称排序。"""
     try:
         entries = []
         for name in sorted(os.listdir(path)):
@@ -1252,19 +1339,47 @@ def _list_dirs(path: str) -> list[str]:
         return []
 
 
+# callback_data は 64 バイト上限のためパス本体を入れられない。
+# トークン（パスの SHA-1 先頭 16 桁）→ パスの対応表をメモリに保持する。
+# bot 再起動でトークンが失効した場合は /ls のやり直しを案内する。
+_ls_tokens: dict[str, str] = {}
+
+# InlineKeyboard はボタン最大 100 個。余裕を持たせつつ表示件数を制限する。
+MAX_LS_ENTRIES = 60
+
+# 同一パスは常に同一トークンのため実質はディレクトリ数で有界だが、念のため上限を設ける。
+# 溢れて失効したトークンは /ls のやり直し案内で復旧する。
+MAX_LS_TOKENS = 1024
+
+
+def _ls_token(path: str) -> str:
+    token = hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
+    if token not in _ls_tokens and len(_ls_tokens) >= MAX_LS_TOKENS:
+        oldest = next(iter(_ls_tokens))
+        del _ls_tokens[oldest]
+    _ls_tokens[token] = path
+    return token
+
+
 def _build_ls_keyboard(current_dir: str) -> InlineKeyboardMarkup:
-    entries = _list_dirs(current_dir)
+    entries = _list_entries(current_dir)
     keyboard = []
     # 上级目录按钮（只在允许范围内时显示）
     parent = os.path.dirname(current_dir)
     if parent != current_dir and _is_within_allowed(os.path.realpath(parent)):
-        keyboard.append([InlineKeyboardButton("📁 ..", callback_data=f"cd:{parent}")])
-    for kind, name in entries:
+        keyboard.append([InlineKeyboardButton("📁 ..", callback_data=f"cd:{_ls_token(parent)}")])
+    shown = entries[:MAX_LS_ENTRIES]
+    for kind, name in shown:
         if kind == "dir":
             full = os.path.join(current_dir, name)
-            keyboard.append([InlineKeyboardButton(f"📂 {name}", callback_data=f"cd:{full}")])
+            keyboard.append([InlineKeyboardButton(f"📂 {name}", callback_data=f"cd:{_ls_token(full)}")])
         else:
             keyboard.append([InlineKeyboardButton(f"📄 {name}", callback_data="cd:noop")])
+    hidden = len(entries) - len(shown)
+    if hidden > 0:
+        keyboard.append(
+            [InlineKeyboardButton(f"…（还有 {hidden} 项未显示）", callback_data="cd:noop")]
+        )
     if not keyboard:
         keyboard.append([InlineKeyboardButton("（空目录）", callback_data="cd:noop")])
     return InlineKeyboardMarkup(keyboard)
@@ -1288,9 +1403,15 @@ async def ls_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("无权限。")
         return
 
-    target = query.data.split(":", 1)[1]
-    if target == "noop":
+    data = query.data.split(":", 1)[1]
+    if data == "noop":
         await query.answer()
+        return
+
+    target = _ls_tokens.get(data)
+    if not target:
+        # bot 再起動等でトークン失効
+        await query.answer("目录列表已过期，请重新执行 /ls。", show_alert=True)
         return
 
     resolved = os.path.realpath(target)
@@ -1302,11 +1423,14 @@ async def ls_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await set_user_setting(user_id, "workdir", resolved)
-    await query.edit_message_text(
-        f"已切换到：{resolved}",
-        reply_markup=_build_ls_keyboard(resolved),
-    )
     await query.answer(f"✅ {os.path.basename(resolved)}")
+    try:
+        await query.edit_message_text(
+            f"已切换到：{resolved}",
+            reply_markup=_build_ls_keyboard(resolved),
+        )
+    except BadRequest as e:
+        _raise_unless_not_modified(e)
 
 
 async def network_error_handler(update, context):

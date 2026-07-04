@@ -5,7 +5,25 @@ on:
     branches: [master]
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax check
+        run: python -m py_compile bot.py
+      - name: Import check
+        # bot.py はトップレベルで .env / /srv 配下のファイル読込を試みるが、
+        # 存在しない場合はいずれも安全にスキップされるため CI ランナー上でも成功する
+        run: |
+          TELEGRAM_BOT_TOKEN=dummy python -c "import bot"
+
   deploy:
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
@@ -17,5 +35,4 @@ jobs:
           script: |
             cd /srv/claudecode-chatbot
             git pull origin master
-            docker compose down
             docker compose up -d --build

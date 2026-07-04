@@ -33,10 +33,10 @@ Telegram 経由で Claude Code CLI を操作するボットです。
 - `/logs [n]` — 最近 n 件のタスクログを表示（デフォルト 8、最大 50）
 - `/cancel` — 実行中のタスクをキャンセル
 - `/reset` — Claude セッションをリセット（先にタスクをキャンセルする必要あり）
-- `/model [alias]` — モデルの確認・切替（略称：sonnet / opus / haiku）
+- `/model [alias]` — モデルの確認・切替（略称：fable / opus / sonnet / haiku）
 - `/models` — 利用可能なモデル一覧（InlineKeyboard で選択）
 - `/workdir [path]` — 作業ディレクトリの確認・切替（許可されたパスプレフィックス内のみ）
-- `/ls` — プロジェクトディレクトリを一覧表示（タップで切替）
+- `/ls` — プロジェクトディレクトリを一覧表示（タップで切替、最大 60 件表示）
 - `/history [n]` — 最近 n 件のタスク履歴を表示（デフォルト 5、最大 20）
 
 テキストメッセージを送信すると、新しいタスクとして Claude Code に送られます。
@@ -61,7 +61,8 @@ Telegram 経由で Claude Code CLI を操作するボットです。
 ### ローカルファイル
 
 - `bot.py` — メインプログラム
-- `claudecode-chatbot.service` — systemd サービス定義
+- `Dockerfile` / `docker-compose.yml` — 本番実行環境（Docker）
+- `.github/workflows/deploy.yml` — 自動デプロイ（master への push で実行）
 - `.env.example` — 環境変数テンプレート
 - `sessions.json` — Claude セッション永続化
 - `tasks/` — タスク状態とログ
@@ -71,10 +72,10 @@ Telegram 経由で Claude Code CLI を操作するボットです。
 必須：
 
 - `TELEGRAM_BOT_TOKEN`
+- `ALLOWED_USER_IDS` — 許可するユーザーID（カンマ区切り、未設定の場合は起動拒否）
 
 任意：
 
-- `ALLOWED_USER_IDS` — 許可するユーザーID（カンマ区切り）
 - `CLAUDE_CMD` — Claude Code CLI パス
 - `CLAUDE_TIMEOUT` — タスクの最大実行時間（秒、デフォルト 3600）
 - `MAX_CONCURRENT_TASKS` — 最大同時実行タスク数（デフォルト 2）
@@ -83,35 +84,46 @@ Telegram 経由で Claude Code CLI を操作するボットです。
 - `STALL_CHECK_INTERVAL` — stalled チェック間隔（秒、デフォルト 60）
 - `TASK_LOG_RETENTION_DAYS` — ログ保持日数（デフォルト 7）
 - `ALLOWED_WORKDIR_PREFIX` — 許可する作業ディレクトリプレフィックス（デフォルト `/home/sikim/project`）
+- `PREFER_LONG_CONTEXT` — 1M（long）コンテキスト版を優先使用（デフォルト 1、`0`/`false`/`no` で無効。使えない場合は自動で通常版にフォールバック）
 
 詳細は `.env.example` を参照。
 
-### 起動・再起動
+### デプロイ・再起動
 
-Python コードや `.env` のみ変更した場合：
+本番は Docker Compose で稼働しています（デプロイ先：`/srv/claudecode-chatbot`）。
+master への push で GitHub Actions（`.github/workflows/deploy.yml`）が自動デプロイします。
 
-```bash
-sudo systemctl restart claudecode-chatbot.service
-```
+**注意：再ビルド・再起動は実行中の Claude タスクを中断します。**
 
-状態確認：
-
-```bash
-sudo systemctl status claudecode-chatbot.service --no-pager
-```
-
-ログ確認：
+手動でコード変更を反映する場合：
 
 ```bash
-sudo journalctl -u claudecode-chatbot.service -n 100 --no-pager
+cd /srv/claudecode-chatbot
+git pull origin master
+docker compose up -d --build
 ```
 
-service ファイル自体を変更した場合：
+`.env` のみ変更した場合：
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl restart claudecode-chatbot.service
+cd /srv/claudecode-chatbot
+docker compose up -d --force-recreate
 ```
+
+状態・ログ確認：
+
+```bash
+docker compose ps
+docker compose logs -f --tail 100
+```
+
+### セキュリティ上の前提
+
+このボットは Claude Code を `--dangerously-skip-permissions` で実行し、コンテナは
+`privileged` + `pid: host` + docker.sock マウントで動作します。つまり
+**`ALLOWED_USER_IDS` に登録されたユーザーはホストの root 相当の操作が可能**です。
+個人・信頼済みユーザー専用の構成であり、不特定多数への公開は想定していません。
+このため `ALLOWED_USER_IDS` が未設定の場合は起動を拒否します。
 
 ### 設計方針
 
@@ -129,9 +141,9 @@ sudo systemctl restart claudecode-chatbot.service
 
 ### 既知の制限
 
-- Claude CLI は最終 JSON を一括返回する方式であり、ストリーミングイベントではない
-- そのため「最近の進捗」は Claude 内部の詳細ステップではなく、bot 外層のタスク実行状態を反映
-- より細かい粒度の進捗が必要な場合は、Claude の出力解析または hook メカニズムの導入が必要
+- 「最近の進捗」は `--output-format stream-json` のイベント（thinking / tool_use / text）から抽出しており、Claude 内部のステップを反映するが、Telegram のステータス更新は最小 3 秒間隔に間引くため全イベントは表示されない
+- `/ls` の一覧は最大 60 件表示。ボタンのトークンは bot 再起動で失効する（`/ls` のやり直しで復旧）
+- bot の再ビルド・再起動は実行中の Claude タスクを中断する
 
 ---
 
@@ -164,10 +176,10 @@ sudo systemctl restart claudecode-chatbot.service
 - `/logs [n]` — 查看最近 n 条任务日志（默认 8，最多 50）
 - `/cancel` — 取消当前正在运行的任务
 - `/reset` — 重置 Claude 会话（需先取消任务）
-- `/model [alias]` — 查看或切换模型（可用简写：sonnet / opus / haiku）
+- `/model [alias]` — 查看或切换模型（可用简写：fable / opus / sonnet / haiku）
 - `/models` — 显示可用模型列表（InlineKeyboard 选择）
 - `/workdir [path]` — 查看或切换工作目录（限制在允许的路径前缀下）
-- `/ls` — 浏览项目目录（点击切换工作目录）
+- `/ls` — 浏览项目目录（点击切换工作目录，最多显示 60 项）
 - `/history [n]` — 查看最近 n 个任务历史（默认 5，最多 20）
 
 直接发送文本消息即可创建新任务。
@@ -192,7 +204,8 @@ sudo systemctl restart claudecode-chatbot.service
 ### 本地文件
 
 - `bot.py` — 主程序
-- `claudecode-chatbot.service` — systemd 服务定义
+- `Dockerfile` / `docker-compose.yml` — 生产运行环境（Docker）
+- `.github/workflows/deploy.yml` — 自动部署（push 到 master 时触发）
 - `.env.example` — 环境变量模板
 - `sessions.json` — Claude 会话持久化
 - `tasks/` — 任务状态和日志
@@ -202,10 +215,10 @@ sudo systemctl restart claudecode-chatbot.service
 必填：
 
 - `TELEGRAM_BOT_TOKEN`
+- `ALLOWED_USER_IDS` — 允许的用户 ID（逗号分隔，未配置时拒绝启动）
 
 可选：
 
-- `ALLOWED_USER_IDS` — 允许的用户 ID（逗号分隔）
 - `CLAUDE_CMD` — Claude Code CLI 路径
 - `CLAUDE_TIMEOUT` — 单个任务最长执行时间（秒，默认 3600）
 - `MAX_CONCURRENT_TASKS` — 同时最多运行多少个任务（默认 2）
@@ -214,35 +227,46 @@ sudo systemctl restart claudecode-chatbot.service
 - `STALL_CHECK_INTERVAL` — stalled 检查间隔（秒，默认 60）
 - `TASK_LOG_RETENTION_DAYS` — 日志保留天数（默认 7）
 - `ALLOWED_WORKDIR_PREFIX` — 允许的工作目录前缀（默认 `/home/sikim/project`）
+- `PREFER_LONG_CONTEXT` — 优先使用 1M（long）上下文版本（默认 1，`0`/`false`/`no` 禁用；不可用时自动回退标准版）
 
 详见 `.env.example`。
 
-### 启动与重启
+### 部署与重启
 
-仅修改 Python 代码或 `.env` 时：
+生产环境通过 Docker Compose 运行（部署目录：`/srv/claudecode-chatbot`）。
+push 到 master 后由 GitHub Actions（`.github/workflows/deploy.yml`）自动部署。
 
-```bash
-sudo systemctl restart claudecode-chatbot.service
-```
+**注意：重新构建/重启会中断正在运行的 Claude 任务。**
 
-查看状态：
-
-```bash
-sudo systemctl status claudecode-chatbot.service --no-pager
-```
-
-查看日志：
+手动更新代码并重启：
 
 ```bash
-sudo journalctl -u claudecode-chatbot.service -n 100 --no-pager
+cd /srv/claudecode-chatbot
+git pull origin master
+docker compose up -d --build
 ```
 
-修改了 service 文件本身时：
+仅修改 `.env` 时：
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl restart claudecode-chatbot.service
+cd /srv/claudecode-chatbot
+docker compose up -d --force-recreate
 ```
+
+查看状态与日志：
+
+```bash
+docker compose ps
+docker compose logs -f --tail 100
+```
+
+### 安全前提
+
+本 bot 以 `--dangerously-skip-permissions` 运行 Claude Code，容器以
+`privileged` + `pid: host` + 挂载 docker.sock 的方式运行。也就是说，
+**`ALLOWED_USER_IDS` 白名单里的用户拥有等同于宿主机 root 的操作能力**。
+本项目仅面向个人/可信用户，不适合对外开放。
+因此 `ALLOWED_USER_IDS` 未配置时会拒绝启动。
 
 ### 设计原则
 
@@ -260,6 +284,6 @@ sudo systemctl restart claudecode-chatbot.service
 
 ### 已知限制
 
-- Claude CLI 当前仍然是一次性返回最终 JSON，不是流式事件接口
-- 因此"最近进展"更多反映 bot 外层任务运行状态，而不是 Claude 内部精细步骤
-- 如果后续需要更细颗粒度进展，需要引入 Claude 输出解析或 hook 机制
+- "最近进展"从 `--output-format stream-json` 的事件（thinking / tool_use / text）中提取，反映 Claude 内部步骤，但 Telegram 状态消息最少间隔 3 秒更新，不会展示全部事件
+- `/ls` 目录列表最多显示 60 项。按钮 token 在 bot 重启后失效（重新执行 `/ls` 即可恢复）
+- 重新构建/重启 bot 会中断正在运行的 Claude 任务
